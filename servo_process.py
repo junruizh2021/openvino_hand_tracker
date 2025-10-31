@@ -10,6 +10,7 @@ import time
 import signal
 import sys
 import os
+import threading
 from typing import Optional, Dict, Any
 import serial
 import fashionstar_uart_sdk as uservo
@@ -24,6 +25,89 @@ from servo_controller import get_servo_controller
 SERVO_ID0 = 0
 SERVO_ID1 = 1
 
+class TaskQueueMonitor:
+    """任务队列监控线程"""
+    
+    def __init__(self, task_queue: TaskQueue, monitor_id: str = "task_monitor"):
+        self.task_queue = task_queue
+        self.monitor_id = monitor_id
+        self.running = False
+        self.thread = None
+        self.logger = logging.getLogger(f"TaskMonitor-{monitor_id}")
+        
+    def start(self):
+        """启动监控线程"""
+        if self.running:
+            self.logger.warning("任务队列监控已在运行")
+            return
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+        self.logger.info(f"任务队列监控已启动: {self.monitor_id}")
+    
+    def stop(self):
+        """停止监控线程"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        self.logger.info(f"任务队列监控已停止: {self.monitor_id}")
+    
+    def _monitor_loop(self):
+        """监控循环"""
+        self.logger.info(f"开始监控任务队列: {self.monitor_id}")
+        
+        while self.running:
+            try:
+                # 获取任务队列状态
+                queue_size = self.task_queue.qsize()
+                is_empty = self.task_queue.empty()
+                is_full = self.task_queue.full()
+                is_executing = self.task_queue.is_executing()
+                
+                # 获取执行控制变量
+                execution_lock_info = f"执行锁: {self.task_queue._execution_lock}"
+                is_executing_value = f"执行状态值: {self.task_queue._is_executing.value}"
+                
+                # 获取队列中所有任务信息
+                all_tasks = self.task_queue.get_all_tasks()
+                
+                # 打印状态信息
+                self.logger.info(f"📊 任务队列状态: 大小={queue_size}, 空={is_empty}, 满={is_full}, 执行中={is_executing}")
+                self.logger.info(f"🔒 执行控制变量: {execution_lock_info}, {is_executing_value}")
+                
+                # 打印任务详情
+                if all_tasks:
+                    self.logger.info("📋 当前任务队列:")
+                    for i, task in enumerate(all_tasks, 1):
+                        task_type = task['task_type']
+                        task_data = task['data']
+                        
+                        if task_type == 'servo_control':
+                            gesture_name = task_data.get('gesture_name', 'Unknown')
+                            description = task_data.get('description', '')
+                            self.logger.info(f"  {i}. 手势控制: {gesture_name} - {description}")
+                        elif task_type == 'voice_servo_control':
+                            angle = task_data.get('angle', 0)
+                            servo_id = task_data.get('servo_id', 0)
+                            client_name = task_data.get('client_name', 'unknown')
+                            self.logger.info(f"  {i}. 语音控制: 舵机{servo_id} -> {angle}° (来自 {client_name})")
+                        else:
+                            self.logger.info(f"  {i}. {task_type}: {task_data}")
+                else:
+                    self.logger.info("📋 队列中无任务")
+                
+                self.logger.info("─" * 60)  # 分隔线
+                
+                # 等待1秒后再次监控
+                time.sleep(0.1)
+                
+            except Exception as e:
+                self.logger.error(f"监控任务队列时发生异常: {e}")
+                time.sleep(1.0)  # 异常时也等待1秒
+        
+        self.logger.info(f"任务队列监控已退出: {self.monitor_id}")
+
 class ServoProcess:
     """舵机控制进程类"""
     
@@ -34,6 +118,9 @@ class ServoProcess:
         self.servo_controller = None
         self.running = False
         self.logger = None
+        
+        # 创建任务队列监控器
+        self.task_monitor = TaskQueueMonitor(self.task_queue, f"{process_id}_monitor")
         
         # 设置信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -114,6 +201,61 @@ class ServoProcess:
             self.logger.error(f"舵机控制回调异常: {e}")
             return False
     
+    def _voice_servo_control_callback(self, angle: float, servo_id: int, client_name: str) -> bool:
+        """
+        语音舵机控制回调函数（同步执行）
+        
+        Args:
+            angle: 目标角度 (-180° 到 180°)
+            servo_id: 舵机ID
+            client_name: 客户端名称
+            
+        Returns:
+            bool: 是否执行成功
+        """
+        try:
+            if self.servo_controller is None:
+                self.logger.error("舵机控制器未初始化")
+                return False
+            
+            self.logger.info(f"执行语音舵机控制: 舵机{servo_id} -> 角度={angle}° (来自 {client_name})")
+            
+            # 验证舵机ID
+            if servo_id not in [0, 1]:
+                self.logger.error(f"无效的舵机ID: {servo_id}")
+                return False
+            
+            # 验证角度范围
+            angle = max(-180.0, min(180.0, float(angle)))
+            
+            # 检查舵机连接状态
+            if not self.servo_controller.ping(servo_id):
+                self.logger.error(f"舵机{servo_id}未连接")
+                return False
+            
+            # 执行舵机角度设置
+            self.servo_controller.set_servo_angle(
+                servo_id=servo_id, 
+                angle=angle, 
+                interval=500,  # 1秒运动时间
+                t_acc=250,     # 加速时间
+                t_dec=250,     # 减速时间
+                is_mturn=True
+            )
+            
+            # 等待运动完成
+            time.sleep(0.5)  # 稍微多等一点时间确保运动完成
+            
+            # 验证角度设置是否成功
+            current_angle = self.servo_controller.query_servo_angle(servo_id)
+            self.logger.info(f"舵机{servo_id}角度设置完成: 目标={angle}°, 当前={current_angle:.1f}°")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"语音舵机控制回调异常: {e}")
+            return False
+    
     def _execute_close_gesture_sequence(self) -> bool:
         """执行(张开🖐️->握拳✊)手势序列（使用舵机0 - 水平方向）"""
         try:
@@ -137,8 +279,8 @@ class ServoProcess:
         """执行比1手势(握拳✊->比1☝️)序列（使用舵机1 - 垂直方向）"""
         try:
             self.logger.info("执行比1手势序列 - 舵机1（垂直方向）")
-            target_angle_0 = 30.0
-            target_angle_1 = 30.0
+            target_angle_0 = 15.0
+            target_angle_1 = 45.0
             # 抬头+右侧转头
             self.servo_controller.set_servo_angle( servo_id = 0, angle = target_angle_0, interval = 500, t_acc=250, t_dec=250,is_mturn=True)
             self.servo_controller.set_servo_angle( servo_id = 1, angle = target_angle_1, interval = 500, t_acc=250, t_dec=250,is_mturn=True)
@@ -177,11 +319,11 @@ class ServoProcess:
         """执行挥手手势序列（使用舵机0 - 云台）"""
         try:
             self.logger.info("执行挥手手势序列 - 舵机0（云台）")
-            target_angle = 30.0
+            target_angle = 45.0
             # 点头动作
             self.servo_controller.set_servo_angle( servo_id = 1, angle = target_angle, interval = 500, t_acc=250, t_dec=250,is_mturn=True)
             time.sleep(0.5)
-            self.servo_controller.set_servo_angle( servo_id = 1, angle = 90.0, interval = 500, t_acc=250, t_dec=250,is_mturn=True)
+            self.servo_controller.set_servo_angle( servo_id = 1, angle = 75.0, interval = 500, t_acc=250, t_dec=250,is_mturn=True)
             time.sleep(0.5)
             self.servo_controller.set_servo_angle( servo_id = 1, angle = target_angle, interval = 500, t_acc=250, t_dec=250,is_mturn=True)
             time.sleep(0.5)
@@ -208,8 +350,15 @@ class ServoProcess:
         # 设置舵机控制回调
         self.consumer.set_servo_control_callback(self._servo_control_callback)
         
+        # 设置语音舵机控制回调
+        self.consumer.set_voice_servo_control_callback(self._voice_servo_control_callback)
+        
         # 启动任务消费者
         self.consumer.start()
+        
+        # 启动任务队列监控器
+        self.task_monitor.start()
+        
         self.running = True
         
         self.logger.info("舵机控制进程已启动，等待任务...")
@@ -246,6 +395,9 @@ class ServoProcess:
         
         # 停止任务消费者
         self.consumer.stop()
+        
+        # 停止任务队列监控器
+        self.task_monitor.stop()
         
         # 断开舵机连接
         self._disconnect_servo_controller(self.servo_controller, "舵机0")

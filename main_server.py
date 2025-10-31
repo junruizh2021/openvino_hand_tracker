@@ -292,9 +292,9 @@ def parse_arguments():
     parser.add_argument("--port", type=int, default=8765, help="WebSocket服务器端口")
     
     # 功能开关
-    parser.add_argument("--dynamic_gestures", action="store_true", 
+    parser.add_argument("--dynamic_gestures", action="store_true", default=True,
                        help="启用动态手势识别")
-    parser.add_argument("--enable_servo", action="store_true", 
+    parser.add_argument("--enable_servo", action="store_true", default=True,
                        help="启用舵机控制")
     parser.add_argument("--no-servo", action="store_true", 
                        help="禁用舵机控制")

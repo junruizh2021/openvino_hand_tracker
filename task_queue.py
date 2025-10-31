@@ -17,6 +17,7 @@ import threading
 class TaskType(Enum):
     """任务类型枚举"""
     SERVO_CONTROL = "servo_control"
+    VOICE_SERVO_CONTROL = "voice_servo_control"
     GESTURE_DETECTED = "gesture_detected"
     SYSTEM_STATUS = "system_status"
     SHUTDOWN = "shutdown"
@@ -151,6 +152,37 @@ class TaskQueue:
         
         return gesture_names
     
+    def get_all_tasks(self) -> list:
+        """获取队列中所有任务的信息列表"""
+        all_tasks = []
+        temp_tasks = []
+        
+        try:
+            # 取出所有任务
+            while not self._queue.empty():
+                task_dict = self._queue.get(block=False)
+                task = Task.from_dict(task_dict)
+                temp_tasks.append(task)
+                
+                # 收集所有任务的基本信息
+                task_info = {
+                    'task_id': task.task_id,
+                    'task_type': task.task_type.value,
+                    'timestamp': task.timestamp,
+                    'data': task.data
+                }
+                all_tasks.append(task_info)
+            
+            # 将任务放回队列
+            for task in temp_tasks:
+                self._queue.put(task.to_dict(), block=False)
+                
+        except Exception as e:
+            # 只在调试模式下记录错误，避免日志噪音
+            self._logger.debug(f"获取任务列表失败: {e}")
+        
+        return all_tasks
+    
     def empty(self) -> bool:
         """检查队列是否为空"""
         return self._queue.empty()
@@ -236,6 +268,49 @@ class TaskProducer:
             self._logger.error(f"创建舵机控制任务失败: {gesture_name}")
         # 只在调试模式下打印队列信息
         self._print_queue_gesture_names()
+        return success
+    
+    def create_voice_servo_control_task(self, angle: float, client_name: str = 'unknown',
+                                       priority: int = 0) -> bool:
+        """
+        创建语音舵机控制任务
+        
+        Args:
+            angle: 目标角度 (-180° 到 180°)
+            client_name: 客户端名称
+            priority: 任务优先级
+            
+        Returns:
+            bool: 是否成功创建任务
+        """
+        # 检查是否正在执行舵机任务
+        if self.task_queue.is_executing():
+            self._logger.warning(f"正在执行舵机任务，拒绝新的语音舵机控制任务: 角度={angle}°")
+            return False
+        
+        # 验证角度范围
+        angle = max(-180.0, min(180.0, float(angle)))
+        
+        task_id = self.task_queue.generate_task_id()
+        task = Task(
+            task_id=task_id,
+            task_type=TaskType.VOICE_SERVO_CONTROL,
+            timestamp=time.time(),
+            data={
+                'angle': angle,
+                'client_name': client_name,
+                'action': 'set_servo_angle',
+                'servo_id': 0  # 默认控制舵机0
+            },
+            priority=priority
+        )
+        
+        success = self.task_queue.put(task)
+        if success:
+            self._logger.info(f"语音舵机控制任务已创建: 角度={angle}° (来自 {client_name}) ({task_id})")
+        else:
+            self._logger.error(f"创建语音舵机控制任务失败: 角度={angle}°")
+        
         return success
     
     def _print_queue_gesture_names(self):
@@ -389,11 +464,21 @@ class TaskConsumer:
         Args:
             task: 要处理的任务
         """
+        is_servo_task = task.task_type in [TaskType.SERVO_CONTROL, TaskType.VOICE_SERVO_CONTROL]
+        
         try:
             self._logger.debug(f"处理任务: {task.task_id} ({task.task_type.value})")
             
+            # 立即设置执行标志，防止生产者在处理期间添加新任务
+            if is_servo_task:
+                if not self.task_queue.start_execution():
+                    self._logger.warning(f"无法开始执行任务，可能已有任务在执行: {task.task_id}")
+                    return
+            
             if task.task_type == TaskType.SERVO_CONTROL:
                 self._handle_servo_control_task(task)
+            elif task.task_type == TaskType.VOICE_SERVO_CONTROL:
+                self._handle_voice_servo_control_task(task)
             elif task.task_type == TaskType.GESTURE_DETECTED:
                 self._handle_gesture_detected_task(task)
             elif task.task_type == TaskType.SYSTEM_STATUS:
@@ -405,38 +490,56 @@ class TaskConsumer:
                 
         except Exception as e:
             self._logger.error(f"处理任务失败 {task.task_id}: {e}")
-            # 可以在这里实现重试逻辑
+        finally:
+            # 无论成功还是失败，都要清除执行状态（仅针对舵机任务）
+            if is_servo_task:
+                self.task_queue.finish_execution()
     
     def _handle_servo_control_task(self, task: Task):
         """处理舵机控制任务"""
         gesture_name = task.data.get('gesture_name')
         description = task.data.get('description')
         
-        # 开始执行任务
-        if not self.task_queue.start_execution():
-            self._logger.warning(f"无法开始执行任务，可能已有任务在执行: {gesture_name}")
-            return
-        
+        # 注意：执行标志已经在 _process_task 中设置，也由其负责清除
         self._logger.info(f"执行舵机控制: {gesture_name} - {description}")
         
-        try:
-            # 这里应该调用实际的舵机控制逻辑
-            # 为了解耦，我们使用回调函数
-            if hasattr(self, 'servo_control_callback'):
-                try:
-                    success = self.servo_control_callback(gesture_name, description)
-                    if success:
-                        self._logger.debug(f"舵机控制执行成功: {gesture_name}")
-                    else:
-                        self._logger.warning(f"舵机控制执行失败: {gesture_name}")
-                except Exception as e:
-                    self._logger.error(f"舵机控制回调异常: {e}")
-            else:
-                self._logger.warning("未设置舵机控制回调函数")
-        finally:
-            # 无论成功还是失败，都要完成执行状态
-            self.task_queue.finish_execution()
-            self._logger.debug(f"舵机控制任务执行完毕: {gesture_name}")
+        # 这里应该调用实际的舵机控制逻辑
+        # 为了解耦，我们使用回调函数
+        if hasattr(self, 'servo_control_callback'):
+            try:
+                success = self.servo_control_callback(gesture_name, description)
+                if success:
+                    self._logger.debug(f"舵机控制执行成功: {gesture_name}")
+                else:
+                    self._logger.warning(f"舵机控制执行失败: {gesture_name}")
+            except Exception as e:
+                self._logger.error(f"舵机控制回调异常: {e}")
+                raise  # 重新抛出异常，让上层处理
+        else:
+            self._logger.warning("未设置舵机控制回调函数")
+    
+    def _handle_voice_servo_control_task(self, task: Task):
+        """处理语音舵机控制任务"""
+        angle = task.data.get('angle')
+        client_name = task.data.get('client_name', 'unknown')
+        servo_id = task.data.get('servo_id', 0)
+        
+        # 注意：执行标志已经在 _process_task 中设置，也由其负责清除
+        self._logger.info(f"执行语音舵机控制: 舵机{servo_id} -> 角度={angle}° (来自 {client_name})")
+        
+        # 调用语音舵机控制回调函数
+        if hasattr(self, 'voice_servo_control_callback'):
+            try:
+                success = self.voice_servo_control_callback(angle, servo_id, client_name)
+                if success:
+                    self._logger.info(f"语音舵机控制执行成功: 舵机{servo_id} -> 角度={angle}°")
+                else:
+                    self._logger.warning(f"语音舵机控制执行失败: 舵机{servo_id} -> 角度={angle}°")
+            except Exception as e:
+                self._logger.error(f"语音舵机控制回调异常: {e}")
+                raise  # 重新抛出异常，让上层处理
+        else:
+            self._logger.warning("未设置语音舵机控制回调函数")
     
     def _handle_gesture_detected_task(self, task: Task):
         """处理手势检测任务"""
@@ -456,6 +559,10 @@ class TaskConsumer:
     def set_servo_control_callback(self, callback):
         """设置舵机控制回调函数"""
         self.servo_control_callback = callback
+    
+    def set_voice_servo_control_callback(self, callback):
+        """设置语音舵机控制回调函数"""
+        self.voice_servo_control_callback = callback
 
 # 全局任务队列实例
 _global_task_queue = None
@@ -492,7 +599,14 @@ if __name__ == "__main__":
         time.sleep(2)  # 模拟舵机控制耗时，增加时间以便观察效果
         return True
     
+    # 设置语音舵机控制回调
+    def test_voice_servo_callback(angle, servo_id, client_name):
+        print(f"执行语音舵机控制: 舵机{servo_id} -> 角度={angle}° (来自 {client_name})")
+        time.sleep(1)  # 模拟舵机控制耗时
+        return True
+    
     consumer.set_servo_control_callback(test_servo_callback)
+    consumer.set_voice_servo_control_callback(test_voice_servo_callback)
     
     # 启动消费者
     consumer.start()
@@ -529,6 +643,22 @@ if __name__ == "__main__":
         
         # 等待任务处理完成
         time.sleep(3)
+        
+        # 测试语音舵机控制任务
+        print("7. 创建语音舵机控制任务...")
+        success4 = producer.create_voice_servo_control_task(angle=45.0, client_name="test_client")
+        print(f"   语音舵机控制任务创建结果: {success4}")
+        
+        # 等待语音舵机控制任务执行完成
+        time.sleep(2)
+        
+        # 测试另一个语音舵机控制任务
+        print("8. 创建第二个语音舵机控制任务...")
+        success5 = producer.create_voice_servo_control_task(angle=-30.0, client_name="test_client2")
+        print(f"   第二个语音舵机控制任务创建结果: {success5}")
+        
+        # 等待任务处理完成
+        time.sleep(2)
         
         # 发送关闭信号
         producer.create_shutdown_task()

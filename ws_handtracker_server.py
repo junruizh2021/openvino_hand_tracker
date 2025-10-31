@@ -16,6 +16,25 @@ import base64
 from collections import deque
 from datetime import datetime
 
+
+# 角度映射工具：将环形阵列麦克风角度(顺时针为 360->180->0)映射为舵机角度(顺时针 0->180,-180->0)
+def map_mic_angle_to_servo(angle_deg: float) -> float:
+    """
+    将麦克风角度(0..360，顺时针递减: 360->180->0)映射为舵机角度([-180,180]，顺时针: 0->180,-180->0)。
+    规则:
+    1) 规范化麦克风角度到 [0, 360)
+    2) 计算顺时针角度 φ_cw = (360 - mic) % 360 （因为麦克风顺时针数值递减）
+    3) 舵机角度 s = wrap_to_180(φ_cw) = ((φ_cw + 180) % 360) - 180
+    """
+    try:
+        mic = float(angle_deg)
+    except (ValueError, TypeError):
+        return 0.0
+    mic_norm = mic % 360.0
+    phi_cw = (360.0 - mic_norm) % 360.0
+    servo = ((phi_cw + 180.0) % 360.0) - 180.0
+    return servo
+
 # 设置Qt环境变量以解决Docker容器中的Qt平台插件问题
 os.environ['QT_QPA_PLATFORM'] = 'xcb'
 os.environ['QT_X11_NO_MITSHM'] = '1'
@@ -275,9 +294,9 @@ class DynamicGestureProcessor:
         Returns:
             bool: 是否匹配
         """
-        # 打印手势序列和模式
-        print(f"手势序列: {gesture_sequence}")
-        print(f"模式: {pattern}")
+        # 打印手势序列和模式（已关闭）
+        # print(f"手势序列: {gesture_sequence}")
+        # print(f"模式: {pattern}")
         
         if not pattern:
             return True
@@ -345,11 +364,11 @@ dynamic_processor = None
 
 class HandTracker:
     def __init__(self, input_src=None,
-                pd_xml="/home/gesture-controller/AI-models/palm_detection_FP32.xml", 
+                pd_xml="models/palm_detection_FP32.xml", 
                 pd_device="NPU",
                 pd_score_thresh=0.5, pd_nms_thresh=0.3,
                 use_lm=True,
-                lm_xml="/home/gesture-controller/AI-models/hand_landmark_FP32.xml",
+                lm_xml="models/hand_landmark_FP32.xml",
                 lm_device="NPU",
                 lm_score_threshold=0.5,
                 use_gesture=False,
@@ -958,73 +977,269 @@ Original Video Input - 显示原始视频输入（带详细信息）
 # 全局HandTracker实例
 ht = None
 
-async def handtracker_websocket_handler(websocket):
-    """手部跟踪WebSocket处理器 - 接收客户端视频流，返回手势识别结果"""
+# 存储所有已连接的客户端
+clients = set()
+
+async def validate_message(data: dict) -> bool:
+    """验证消息格式"""
+    required_fields = ['type']
+    return all(field in data for field in required_fields)
+
+async def send_error(websocket, error_message: str):
+    """发送错误消息"""
+    error_response = {
+        'type': 'error',
+        'message': error_message,
+        'timestamp': datetime.now().timestamp()
+    }
+    await websocket.send(json.dumps(error_response))
+
+async def broadcast_to_others(sender_websocket, message: dict):
+    """广播消息给除发送者外的所有客户端"""
+    global clients
+    if not clients:
+        return
+        
+    disconnected_clients = set()
+    for client in clients:
+        if client != sender_websocket:
+            try:
+                await client.send(json.dumps(message))
+            except websockets.exceptions.ConnectionClosed:
+                disconnected_clients.add(client)
+    
+    # 清理断开的连接
+    clients.difference_update(disconnected_clients)
+
+async def handle_voice_message(websocket, data: dict):
+    """处理语音消息"""
+    angle = data.get('angle')
+    client_name = data.get('client_name', 'unknown')
+    timestamp = data.get('timestamp', datetime.now().timestamp())
+    
+    print(f"收到语音角度信息: {angle}° (来自 {client_name})")
+    
+    # 验证角度值
+    if angle is None:
+        print("错误：语音消息中缺少角度信息")
+        return {
+            'type': 'error',
+            'message': '语音消息中缺少角度信息',
+            'timestamp': datetime.now().timestamp()
+        }
+    
+    try:
+        # 原始输入角度可能来自环形阵列麦克风(0..360, 顺时针 360->180->0)
+        # 将其映射为舵机所需的角度([-180,180]，顺时针 0->180,-180->0)
+        raw_angle = float(angle)
+        mapped_angle = map_mic_angle_to_servo(raw_angle)
+        # 最终再夹紧，保证安全
+        angle = max(-180.0, min(180.0, mapped_angle))
+    except (ValueError, TypeError):
+        print(f"错误：无效的角度值: {angle}")
+        return {
+            'type': 'error',
+            'message': f'无效的角度值: {angle}',
+            'timestamp': datetime.now().timestamp()
+        }
+    
+    # 创建舵机控制任务
+    task_success = False
+    task_message = ""
+    
+    try:
+        from task_queue import get_task_producer
+        producer = get_task_producer()
+        
+        # 创建语音舵机控制任务
+        success = producer.create_voice_servo_control_task(
+            angle=angle,
+            client_name=client_name,
+            priority=0  # 高优先级
+        )
+        
+        if success:
+            print(f"语音舵机控制任务已发送到队列: 角度={angle}° (由输入 {raw_angle}° 映射)")
+            task_success = True
+            task_message = "任务已加入队列，舵机将开始旋转"
+        else:
+            print(f"发送语音舵机控制任务失败: 角度={angle}°")
+            task_success = False
+            task_message = "任务队列已满或正在执行其他任务，请稍后再试"
+            
+    except ImportError:
+        print("任务队列模块未找到，跳过舵机控制")
+        task_success = False
+        task_message = "任务队列模块未找到"
+    except Exception as e:
+        print(f"语音舵机控制任务发送异常: {e}")
+        task_success = False
+        task_message = f"任务发送异常: {str(e)}"
+    
+    # 发送任务状态响应给发送者
+    task_response = {
+        'type': 'voice_task_status',
+        'angle': angle,
+        'success': task_success,
+        'message': task_message,
+        'timestamp': timestamp,
+        'client_name': client_name
+    }
+    
+    # 发送任务状态给发送者
+    await websocket.send(json.dumps(task_response))
+    
+    # 广播给所有其他客户端（不包含任务状态）
+    broadcast_response = {
+        'type': 'voice',
+        'angle': angle,
+        'timestamp': timestamp,
+        'client_name': client_name,
+        'from_client': id(websocket)
+    }
+    
+    # 广播语音消息给其他客户端
+    await broadcast_to_others(websocket, broadcast_response)
+    
+    return task_response
+
+async def handle_video_message(websocket, data: dict, message_bytes=None):
+    """处理视频消息 - 兼容现有的handtracker功能"""
     global ht
-    print(f"客户端连接: {websocket.remote_address}")
+    
+    try:
+        # 更新FPS
+        if hasattr(ht, 'fps'):
+            ht.fps.update()
+        
+        # 处理视频帧数据
+        if message_bytes:
+            # 从二进制数据解码视频帧
+            nparr = np.frombuffer(message_bytes, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is not None:
+                # 进行手部跟踪和手势识别
+                result, annotated_frame = await ht.process_frame_async(message_bytes)
+                
+                if result is not None:
+                    # 更新FPS信息
+                    result['fps'] = float(ht.fps.fps if hasattr(ht, 'fps') else 0)
+                    result['type'] = 'video_result'  # 添加消息类型标识
+                    return result
+                else:
+                    # 发送空结果
+                    return {
+                        'type': 'video_result',
+                        'frame': '',
+                        'hands': [],
+                        'fps': float(ht.fps.fps if hasattr(ht, 'fps') else 0)
+                    }
+            else:
+                print("无法解码视频帧")
+                return None
+        else:
+            print("没有视频数据")
+            return None
+            
+    except Exception as e:
+        print(f"处理视频帧时出错: {e}")
+        return {
+            'type': 'video_result',
+            'frame': '',
+            'hands': [],
+            'fps': float(ht.fps.fps if hasattr(ht, 'fps') else 0),
+            'error': str(e)
+        }
+
+async def handle_ping_message(websocket, data: dict):
+    """处理心跳消息"""
+    timestamp = data.get('timestamp', datetime.now().timestamp())
+    client_name = data.get('client_name', 'unknown')
+    
+    print(f"收到心跳消息 (来自 {client_name})")
+    
+    # 回复 pong
+    pong_response = {
+        'type': 'pong',
+        'timestamp': datetime.now().timestamp(),
+        'original_timestamp': timestamp
+    }
+    await websocket.send(json.dumps(pong_response))
+    return pong_response
+
+async def handtracker_websocket_handler(websocket):
+    """基于消息类型的WebSocket处理器 - 支持handtracker和voice客户端"""
+    global ht, clients
+    client_id = id(websocket)
+    clients.add(websocket)
+    print(f"客户端连接: {websocket.remote_address} (ID: {client_id})")
     
     try:
         # 发送初始配置信息
         config = {
+            'type': 'system',
             'message': 'HandTracker WebSocket Server Ready',
-            'gesture_support': ht.use_gesture,
-            'landmark_support': ht.use_lm
+            'gesture_support': ht.use_gesture if ht else False,
+            'landmark_support': ht.use_lm if ht else False,
+            'client_id': client_id,
+            'timestamp': datetime.now().timestamp()
         }
         await websocket.send(json.dumps(config))
         
-        # 等待客户端发送视频元数据
-        meta_msg = await websocket.recv()
-        meta = json.loads(meta_msg)
-        width, height, fps = meta["width"], meta["height"], meta["fps"]
-        print(f"接收到视频参数: {width}x{height}, {fps}fps")
-        
-        # 初始化FPS计算器
-        ht.fps = FPS(mean_nb_frames=20)
-        
-        # 处理视频流
+        # 处理消息流
         async for message in websocket:
             try:
-                # 更新FPS
-                ht.fps.update() 
-                # 解码视频帧
+                # 尝试解析 JSON 消息
                 if isinstance(message, (bytes, bytearray)):
-                    nparr = np.frombuffer(message, np.uint8)
-                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    
-                    if frame is not None:
-                        # 进行手部跟踪和手势识别
-                        result, annotated_frame = await ht.process_frame_async(message)
-                        
-                        if result is not None:
-                            # 更新FPS信息
-                            result['fps'] = float(ht.fps.fps)
-                            
-                            # 发送手势识别结果到客户端
-                            await websocket.send(json.dumps(result))
-                        else:
-                            # 发送空结果
-                            empty_result = {
-                                'frame': '',
-                                'hands': [],
-                                'fps': float(ht.fps.fps)
-                            }
-                            await websocket.send(json.dumps(empty_result))
-                    else:
-                        print("无法解码视频帧")
+                    # 二进制数据 - 可能是视频帧
+                    result = await handle_video_message(websocket, {}, message)
+                    if result:
+                        await websocket.send(json.dumps(result))
                 else:
-                    print("收到非二进制消息，忽略:", message)
+                    # JSON 消息
+                    try:
+                        data = json.loads(message)
+                        
+                        # 验证消息格式
+                        if not await validate_message(data):
+                            await send_error(websocket, "Invalid message format: missing required fields")
+                            continue
+                        
+                        message_type = data.get('type', 'unknown')
+                        
+                        # 根据消息类型路由
+                        if message_type == 'video':
+                            # 处理视频消息（兼容现有handtracker客户端）
+                            result = await handle_video_message(websocket, data)
+                            if result:
+                                await websocket.send(json.dumps(result))
+                        elif message_type == 'voice':
+                            # 处理语音消息
+                            result = await handle_voice_message(websocket, data)
+                            # 可以选择是否回复
+                        elif message_type == 'ping':
+                            # 处理心跳消息
+                            await handle_ping_message(websocket, data)
+                        else:
+                            await send_error(websocket, f"Unknown message type: {message_type}")
+                            
+                    except json.JSONDecodeError:
+                        # 如果不是 JSON，可能是二进制数据（如视频帧）
+                        result = await handle_video_message(websocket, {}, message)
+                        if result:
+                            await websocket.send(json.dumps(result))
                     
             except websockets.exceptions.ConnectionClosed:
                 print("客户端断开连接")
                 break
             except Exception as e:
-                print(f"处理视频帧时出错: {e}")
+                print(f"处理消息时出错: {e}")
                 # 发送错误信息
                 error_result = {
-                    'frame': '',
-                    'hands': [],
-                    'fps': float(ht.fps.fps if hasattr(ht, 'fps') else 0),
-                    'error': str(e)
+                    'type': 'error',
+                    'message': str(e),
+                    'timestamp': datetime.now().timestamp()
                 }
                 try:
                     await websocket.send(json.dumps(error_result))
@@ -1032,11 +1247,12 @@ async def handtracker_websocket_handler(websocket):
                     break
                 
     except websockets.exceptions.ConnectionClosed:
-        print("客户端断开连接")
+        print(f"客户端断开连接 (ID: {client_id})")
     except Exception as e:
         print(f"WebSocket连接错误: {e}")
     finally:
-        print("WebSocket连接已关闭")
+        clients.discard(websocket)  # 清理客户端连接
+        print(f"WebSocket连接已关闭 (ID: {client_id})")
 
 async def initialize_handtracker():
     """初始化HandTracker和动态手势处理器"""

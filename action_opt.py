@@ -73,10 +73,10 @@ if __name__ == '__main__':
 	# t_acc：加速时间 ms
 	# t_dec：减速时间 ms
 	# is_mturn：是否多圈（默认True)
-	control.set_servo_angle( servo_id = SERVO_ID0, angle = 0, interval = 1000, t_acc=500, t_dec=500,is_mturn=True)
+	control.set_servo_angle( servo_id = SERVO_ID0, angle = 0.0, interval = 1000, t_acc=500, t_dec=500,is_mturn=True)
 	logger.info(f"舵机{SERVO_ID0}执行完成: 角度=0°, 执行时间=1000ms")
 	time.sleep(1)
-	control.set_servo_angle( servo_id = SERVO_ID1, angle = 60, interval = 1000, t_acc=500, t_dec=500,is_mturn=True)
+	control.set_servo_angle( servo_id = SERVO_ID1, angle = 60.0, interval = 1000, t_acc=500, t_dec=500,is_mturn=True)
 	logger.info(f"舵机{SERVO_ID1}执行完成: 角度=60°, 执行时间=1000ms")
 	time.sleep(1)
 	print("舵机初始化完成")
